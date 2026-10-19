@@ -2,13 +2,6 @@
 
 Proyecto personal para crear **una microlección técnica nueva por día** con Ollama (`qwen3.5:9b`), validar su formato, guardarla en Markdown, crear un commit Git y opcionalmente enviarlo a GitHub. No genera commits vacíos ni ejecuta el código sugerido por la IA.
 
-## Transparencia
-
-- Este proyecto **no recupera commits perdidos** de otras computadoras ni acredita trabajo humano diario.
-- Las entradas generadas mediante `backfill` están claramente señaladas como **retrospectivas**, contienen la fecha de generación real y usan la fecha del catálogo como `GIT_AUTHOR_DATE`. La fecha de committer sigue siendo la fecha real de creación. GitHub puede mostrarlas en fechas anteriores, pero siguen siendo contenido creado posteriormente.
-- Las entradas son **material generado con IA, pendiente de revisión**. No las presentes como código desarrollado y probado por ti sin verificarlo.
-- Usa un **repositorio nuevo y tuyo**, no proyectos de trabajo o compartidos. No se fuerza ningún push ni se reescribe el historial.
-
 ## Requisitos
 
 1. Windows 10/11, Python 3.10 o posterior, Git y una cuenta de GitHub.
