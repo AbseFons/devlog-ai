@@ -7,6 +7,8 @@ No ejecuta código generado por el modelo. No altera otros repositorios.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import random
 import json
 import os
 import re
@@ -26,6 +28,8 @@ TIMEOUT = int(os.getenv('DEVLOG_TIMEOUT', '360'))
 # Se descarga de RAM tras cinco minutos de inactividad; Ollama lo carga bajo demanda.
 KEEP_ALIVE = os.getenv('DEVLOG_KEEP_ALIVE', '5m')
 MAX_GENERATION_ATTEMPTS = 3
+DEFAULT_MIN_COMMITS = 2
+DEFAULT_MAX_COMMITS = 5
 
 TOPICS = [
     'Git: diferencia entre merge y rebase',
@@ -128,20 +132,35 @@ SCHEMA = {
 }
 
 
-def selected_topic(target: date) -> str:
-    number = (target - START_DATE).days
+def selected_topic(target: date, slot: int = 1) -> str:
+    number = (target - START_DATE).days + (slot - 1) * 13
     round_number = max(0, number) // len(TOPICS) + 1
     topic = TOPICS[number % len(TOPICS)]
     return f'{topic} (serie {round_number})'
 
 
-def generate(target: date) -> dict[str, str]:
+def daily_target(target: date, minimum: int, maximum: int) -> int:
+    """Distribución uniforme reproducible por fecha y configuración.
+
+    No usamos hash() de Python porque cambia entre ejecuciones. Repetir un día
+    conserva su objetivo y permite reanudar sin commits duplicados.
+    """
+    if not 1 <= minimum <= maximum <= 10:
+        raise ValueError('El rango debe estar entre 1 y 10, y mínimo <= máximo.')
+    seed = int.from_bytes(hashlib.sha256(
+        f'devlog-v1.2:{target.isoformat()}:{minimum}:{maximum}'.encode('utf-8')
+    ).digest()[:8], 'big')
+    return random.Random(seed).randint(minimum, maximum)
+
+
+def generate(target: date, slot: int = 1) -> dict[str, str]:
     """Solicita una lección, valida la salida y reintenta respuestas mal formadas."""
-    topic = selected_topic(target)
+    topic = selected_topic(target, slot)
     prompt = (
         'Eres un mentor de ingeniería de software. Responde SOLO con JSON según el esquema. '
         'Redacta una microlección ORIGINAL y útil en español, orientada a desarrolladores. '
         f'Tema asignado: {topic}. Fecha de catálogo: {target.isoformat()}. '
+        f'Entrada numerada del día: {slot}. Crea un contenido distinto para este tema. '
         'Escribe un título concreto, un objetivo comprobable (20-60 palabras), '
         'una explicación de 100-180 palabras, un ejemplo de código en Markdown '
         'con un caso de uso realista (no uses comandos destructivos ni credenciales), '
@@ -226,12 +245,13 @@ def validate(item: object) -> None:
         raise ValueError('El ejemplo no contiene un bloque de código Markdown completo (apertura y cierre).')
 
 
-def to_markdown(target: date, item: dict[str, str], generated_at: datetime, retro: bool) -> str:
+def to_markdown(target: date, item: dict[str, str], generated_at: datetime, retro: bool, slot: int = 1) -> str:
     mode = 'Retrospectiva (no demuestra actividad humana en esa fecha)' if retro else 'Programada / generación del día'
     fields = [
         f'# {item["titulo"].strip()}',
         '',
         f'- **Fecha del catálogo:** {target.isoformat()}',
+        f'- **Entrada n.º:** {slot}',
         f'- **Generado realmente:** {generated_at.isoformat(timespec="seconds")}',
         f'- **Tipo:** {mode}',
         f'- **Modelo local:** {MODEL}',
@@ -269,21 +289,24 @@ def check_clean() -> None:
         raise RuntimeError('El repositorio tiene cambios sin registrar. Revisa git status antes de automatizar.')
 
 
-def file_for(target: date) -> Path:
-    return ENTRIES / str(target.year) / f'{target.isoformat()}.md'
+def file_for(target: date, slot: int = 1) -> Path:
+    if slot < 1 or slot > 10:
+        raise ValueError('El número de entrada debe estar entre 1 y 10.')
+    suffix = '' if slot == 1 else f'-{slot:02d}'
+    return ENTRIES / str(target.year) / f'{target.isoformat()}{suffix}.md'
 
 
-def create(target: date, *, retrospective: bool, no_push: bool) -> bool:
-    output = file_for(target)
+def create(target: date, *, retrospective: bool, no_push: bool, slot: int = 1) -> bool:
+    output = file_for(target, slot)
     if output.exists():
         print(f'[OMITIDO] Ya existe {output.relative_to(ROOT)}')
         return False
     check_clean()
-    print(f'[GENERANDO] {target.isoformat()} · {selected_topic(target)}', flush=True)
-    item = generate(target)
+    print(f'[GENERANDO] {target.isoformat()} · entrada {slot:02d} · {selected_topic(target, slot)}', flush=True)
+    item = generate(target, slot)
     now = datetime.now().astimezone()
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(to_markdown(target, item, now, retrospective), encoding='utf-8')
+    output.write_text(to_markdown(target, item, now, retrospective, slot), encoding='utf-8')
     path_rel = output.relative_to(ROOT).as_posix()
     env = os.environ.copy()
     if retrospective:
@@ -295,12 +318,12 @@ def create(target: date, *, retrospective: bool, no_push: bool) -> bool:
     try:
         git('add', '--', path_rel)
         tag = 'retro' if retrospective else 'diario'
-        git('commit', '-m', f'docs({tag}): lección {target.isoformat()} [generada con IA]', '--', path_rel, env=env)
+        git('commit', '-m', f'docs({tag}): lección {target.isoformat()} #{slot:02d} [generada con IA]', '--', path_rel, env=env)
     except Exception:
         # El archivo no se elimina para permitir revisión y recuperación manual.
         print(f'[AVISO] El archivo está en {path_rel}; revisa git status para resolver el error.', file=sys.stderr)
         raise
-    print(f'[COMMIT] {target.isoformat()}')
+    print(f'[COMMIT] {target.isoformat()} · entrada {slot:02d}')
     return True
 
 
@@ -326,10 +349,18 @@ def parse_date(raw: str) -> date:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='DevLog AI — diario de desarrollo con Qwen local')
     sub = parser.add_subparsers(dest='command', required=True)
-    daily = sub.add_parser('daily', help='Genera una entrada y un commit de hoy')
+    def add_count_options(command):
+        command.add_argument('--min-commits', type=int, default=DEFAULT_MIN_COMMITS,
+                             help=f'Mínimo de commits diarios (por defecto {DEFAULT_MIN_COMMITS})')
+        command.add_argument('--max-commits', type=int, default=DEFAULT_MAX_COMMITS,
+                             help=f'Máximo de commits diarios (por defecto {DEFAULT_MAX_COMMITS})')
+
+    daily = sub.add_parser('daily', help='Genera varias entradas y commits de hoy')
+    add_count_options(daily)
     daily.add_argument('--no-push', action='store_true')
 
     backfill = sub.add_parser('backfill', help='Crea retrospectivamente entradas que faltan')
+    add_count_options(backfill)
     backfill.add_argument('--start', type=parse_date, default=START_DATE)
     backfill.add_argument('--end', type=parse_date, default=date(2026, 10, 19))
     backfill.add_argument('--limit', type=int, default=5, help='Máximo de entradas por ejecución (por defecto, 5)')
@@ -337,10 +368,13 @@ def main(argv: list[str] | None = None) -> int:
     backfill.add_argument('--no-push', action='store_true')
 
     catchup = sub.add_parser('catchup', help='Incluye hoy y recupera ejecuciones automatizadas perdidas')
+    add_count_options(catchup)
     catchup.add_argument('--days', type=int, default=7)
     catchup.add_argument('--no-push', action='store_true')
 
     args = parser.parse_args(argv)
+    if not 1 <= args.min_commits <= args.max_commits <= 10:
+        parser.error('Indica --min-commits y --max-commits entre 1 y 10 (min <= max).')
     check_repo()
     today = datetime.now().astimezone().date()
     dates: list[date]
@@ -353,7 +387,11 @@ def main(argv: list[str] | None = None) -> int:
             parser.error('El intervalo debe ser válido y no incluir fechas futuras.')
         if not 1 <= args.limit <= 366:
             parser.error('--limit debe estar entre 1 y 366.')
-        dates = [d for d in days_in_range(args.start, args.end) if not file_for(d).exists()][:args.limit]
+        dates = [
+            d for d in days_in_range(args.start, args.end)
+            if any(not file_for(d, slot).exists()
+                   for slot in range(1, daily_target(d, args.min_commits, args.max_commits) + 1))
+        ][:args.limit]
     else:
         if not 1 <= args.days <= 366:
             parser.error('--days debe estar entre 1 y 366.')
@@ -361,12 +399,19 @@ def main(argv: list[str] | None = None) -> int:
         dates = list(days_in_range(start, today))
 
     count = 0
+    skipped = 0
     for target in dates:
+        target_count = daily_target(target, args.min_commits, args.max_commits)
+        print(f'[PLAN] {target.isoformat()} · objetivo: {target_count} commit(s)', flush=True)
         retro = target != today
-        count += bool(create(target, retrospective=retro, no_push=args.no_push))
+        for slot in range(1, target_count + 1):
+            if create(target, retrospective=retro, no_push=args.no_push, slot=slot):
+                count += 1
+            else:
+                skipped += 1
     if count and not args.no_push:
         push()
-    print(f'[FIN] {count} commit(s) nuevos; {len(dates)-count} entrada(s) ya existían.')
+    print(f'[FIN] {count} commit(s) nuevos; {skipped} entrada(s) ya existían.')
     return 0
 
 
