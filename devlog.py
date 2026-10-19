@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import date, datetime, time, timedelta
@@ -22,6 +23,9 @@ START_DATE = date(2026, 8, 20)
 MODEL = os.getenv('DEVLOG_MODEL', 'qwen3.5:9b')
 OLLAMA_URL = os.getenv('DEVLOG_OLLAMA_URL', 'http://127.0.0.1:11434/api/chat')
 TIMEOUT = int(os.getenv('DEVLOG_TIMEOUT', '360'))
+# Se descarga de RAM tras cinco minutos de inactividad; Ollama lo carga bajo demanda.
+KEEP_ALIVE = os.getenv('DEVLOG_KEEP_ALIVE', '5m')
+MAX_GENERATION_ATTEMPTS = 3
 
 TOPICS = [
     'Git: diferencia entre merge y rebase',
@@ -112,7 +116,10 @@ SCHEMA = {
         'titulo': {'type': 'string'},
         'objetivo': {'type': 'string'},
         'explicacion': {'type': 'string'},
-        'ejemplo': {'type': 'string'},
+        'ejemplo': {
+            'type': 'string',
+            'description': 'Incluye código real en un bloque Markdown con apertura ```python y cierre ``` en líneas separadas.'
+        },
         'ejercicio': {'type': 'string'},
         'criterios': {'type': 'string'},
     },
@@ -129,6 +136,7 @@ def selected_topic(target: date) -> str:
 
 
 def generate(target: date) -> dict[str, str]:
+    """Solicita una lección, valida la salida y reintenta respuestas mal formadas."""
     topic = selected_topic(target)
     prompt = (
         'Eres un mentor de ingeniería de software. Responde SOLO con JSON según el esquema. '
@@ -138,43 +146,71 @@ def generate(target: date) -> dict[str, str]:
         'una explicación de 100-180 palabras, un ejemplo de código en Markdown '
         'con un caso de uso realista (no uses comandos destructivos ni credenciales), '
         'un ejercicio reproducible y criterios específicos para revisarlo. '
+        'REQUISITO OBLIGATORIO del campo "ejemplo": debe contener un bloque de código real '
+        'en Markdown, que EMPIECE en una línea con tres acentos graves y un lenguaje '
+        '(por ejemplo ```python), tenga varias líneas de código y TERMINE en una línea '
+        'con tres acentos graves. Incluye el bloque dentro de la cadena JSON como texto '
+        'con saltos de línea escapados, no como una propiedad aparte. '
         'No inventes que alguien trabajó ese día, ni afirmes que el ejemplo fue probado. '
         'Evita clichés y contenido de relleno. Devuelve cadenas simples en todos los campos.'
     )
-    payload = {
-        'model': MODEL,
-        'messages': [
-            {'role': 'system', 'content': 'Eres un asistente de documentación técnica preciso. Responde solo con JSON válido.'},
-            {'role': 'user', 'content': prompt},
-        ],
-        'format': SCHEMA,
-        'stream': False,
-        'think': False,
-        'options': {'temperature': 0.35},
-    }
-    req = Request(
-        OLLAMA_URL,
-        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
-        headers={'Content-Type': 'application/json'},
-        method='POST',
+    messages = [
+        {'role': 'system', 'content': 'Eres un asistente de documentación técnica preciso. Responde solo con JSON válido.'},
+        {'role': 'user', 'content': prompt},
+    ]
+    last_error = None
+    for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+        payload = {
+            'model': MODEL,
+            'messages': messages,
+            'format': SCHEMA,
+            'stream': False,
+            'think': False,
+            'keep_alive': KEEP_ALIVE,
+            'options': {'temperature': 0.2},
+        }
+        req = Request(
+            OLLAMA_URL,
+            data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        try:
+            with urlopen(req, timeout=TIMEOUT) as response:
+                outer = json.load(response)
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(
+                'No se pudo consultar Ollama. Verifica que Ollama esté funcionando '
+                f'y que el modelo {MODEL!r} esté instalado. Detalle: {exc}'
+            ) from exc
+        raw = outer.get('message', {}).get('content', '')
+        if not raw:
+            last_error = ValueError('Ollama devolvió una respuesta vacía.')
+        else:
+            try:
+                item = json.loads(raw)
+                validate(item)
+                return item
+            except (ValueError, TypeError) as exc:
+                last_error = exc
+
+        if attempt < MAX_GENERATION_ATTEMPTS:
+            print(f'[REINTENTO {attempt}/{MAX_GENERATION_ATTEMPTS}] '
+                  f'Qwen no cumplió el formato: {last_error}', flush=True)
+            # No ejecutamos ni archivamos la respuesta inválida.
+            messages = [
+                messages[0], messages[1],
+                {'role': 'user', 'content':
+                    'La respuesta anterior fue rechazada: '
+                    f'{last_error}. Regenera los seis campos desde cero. '
+                    'En particular, el campo "ejemplo" DEBE incluir un bloque de código '
+                    'Markdown completo: apertura ```python, código con saltos de línea, '
+                    'cierre ```. Devuelve exclusivamente el objeto JSON válido.'},
+            ]
+    raise RuntimeError(
+        f'Qwen no produjo contenido válido tras {MAX_GENERATION_ATTEMPTS} intentos. '
+        f'Último problema: {last_error}. No se guardó ni publicó ningún commit.'
     )
-    try:
-        with urlopen(req, timeout=TIMEOUT) as response:
-            outer = json.load(response)
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(
-            'No se pudo consultar Ollama. Verifica que Ollama esté funcionando '
-            f'y que el modelo {MODEL!r} esté instalado. Detalle: {exc}'
-        ) from exc
-    raw = outer.get('message', {}).get('content', '')
-    if not raw:
-        raise RuntimeError(f'Ollama devolvió una respuesta vacía: {outer.get("error", "sin detalle")}')
-    try:
-        item = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError('Ollama devolvió JSON inválido; no se generó ningún commit.') from exc
-    validate(item)
-    return item
 
 
 def validate(item: object) -> None:
@@ -186,8 +222,8 @@ def validate(item: object) -> None:
         val = item[key]
         if not isinstance(val, str) or not (minimum <= len(val.strip()) <= 18000):
             raise ValueError(f'Campo insuficiente, excesivo o inválido: {key}')
-    if '```' not in item['ejemplo']:
-        raise ValueError('El ejemplo no contiene un bloque de código Markdown.')
+    if not re.search(r'(?m)^```[a-zA-Z0-9_+.-]*\s*\n[\s\S]+?\n```(?:\s|$)', item['ejemplo']):
+        raise ValueError('El ejemplo no contiene un bloque de código Markdown completo (apertura y cierre).')
 
 
 def to_markdown(target: date, item: dict[str, str], generated_at: datetime, retro: bool) -> str:
