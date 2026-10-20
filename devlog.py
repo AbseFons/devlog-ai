@@ -7,6 +7,7 @@ No ejecuta código generado por el modelo. No altera otros repositorios.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import random
 import json
@@ -28,6 +29,11 @@ TIMEOUT = int(os.getenv('DEVLOG_TIMEOUT', '360'))
 # Se descarga de RAM tras cinco minutos de inactividad; Ollama lo carga bajo demanda.
 KEEP_ALIVE = os.getenv('DEVLOG_KEEP_ALIVE', '5m')
 MAX_GENERATION_ATTEMPTS = 3
+
+
+class GenerationFormatError(RuntimeError):
+    """La respuesta de Ollama es inválida, pero el lote puede continuar."""
+
 DEFAULT_MIN_COMMITS = 1
 DEFAULT_MAX_COMMITS = 10
 
@@ -121,8 +127,14 @@ SCHEMA = {
         'objetivo': {'type': 'string'},
         'explicacion': {'type': 'string'},
         'ejemplo': {
-            'type': 'string',
-            'description': 'Incluye código real en un bloque Markdown con apertura ```python y cierre ``` en líneas separadas.'
+            'type': 'object',
+            'properties': {
+                'descripcion': {'type': 'string'},
+                'lenguaje': {'type': 'string'},
+                'codigo': {'type': 'string'},
+            },
+            'required': ['descripcion', 'lenguaje', 'codigo'],
+            'additionalProperties': False,
         },
         'ejercicio': {'type': 'string'},
         'criterios': {'type': 'string'},
@@ -161,28 +173,66 @@ def daily_target(target: date, minimum: int, maximum: int) -> int:
     return distribution[slot]
 
 
+def normalize_generated_item(item: object) -> object:
+    """Formatea los bloques Markdown en Python, en vez de pedírselos a Qwen.
+
+    También admite respuestas antiguas donde «ejemplo» era una cadena con
+    Markdown, para no romper compatibilidad con entradas y pruebas v1.3.
+    """
+    if not isinstance(item, dict):
+        return item
+    example = item.get('ejemplo')
+    if not isinstance(example, dict):
+        return item
+    if set(example) != {'descripcion', 'lenguaje', 'codigo'}:
+        raise ValueError('El objeto ejemplo requiere descripcion, lenguaje y codigo.')
+    description = example['descripcion']
+    language = example['lenguaje']
+    code = example['codigo']
+    if not all(isinstance(x, str) for x in (description, language, code)):
+        raise ValueError('Los campos de ejemplo deben ser cadenas JSON.')
+    description = description.strip()
+    language = language.strip().lower()
+    code = code.strip().replace('\r\n', '\n')
+    if not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_+.#-]{0,23}', language):
+        raise ValueError('El lenguaje del ejemplo es inválido.')
+    if len(description) < 20:
+        raise ValueError('La descripción del ejemplo es insuficiente.')
+
+    # Algunos modelos devuelven accidentalmente un bloque ya delimitado.
+    # Si está completo, quitar los delimitadores y construirlos nosotros.
+    lines = code.splitlines()
+    if lines and lines[0].startswith('```') and lines[-1].strip() == '```':
+        code = '\n'.join(lines[1:-1]).strip()
+    if '```' in code or len(code) < 25 or len(code.splitlines()) < 2:
+        raise ValueError('El ejemplo no contiene varias líneas de código utilizable.')
+
+    normalized = dict(item)
+    normalized['ejemplo'] = f'{description}\n\n```{language}\n{code}\n```'
+    return normalized
+
+
 def generate(target: date, slot: int = 1) -> dict[str, str]:
-    """Solicita una lección, valida la salida y reintenta respuestas mal formadas."""
+    """Pide código como un campo JSON separado y arma Markdown de forma estable."""
     topic = selected_topic(target, slot)
     prompt = (
         'Eres un mentor de ingeniería de software. Responde SOLO con JSON según el esquema. '
-        'Redacta una microlección ORIGINAL y útil en español, orientada a desarrolladores. '
-        f'Tema asignado: {topic}. Fecha de catálogo: {target.isoformat()}. '
-        f'Entrada numerada del día: {slot}. Crea un contenido distinto para este tema. '
-        'Escribe un título concreto, un objetivo comprobable (20-60 palabras), '
-        'una explicación de 100-180 palabras, un ejemplo de código en Markdown '
-        'con un caso de uso realista (no uses comandos destructivos ni credenciales), '
-        'un ejercicio reproducible y criterios específicos para revisarlo. '
-        'REQUISITO OBLIGATORIO del campo "ejemplo": debe contener un bloque de código real '
-        'en Markdown, que EMPIECE en una línea con tres acentos graves y un lenguaje '
-        '(por ejemplo ```python), tenga varias líneas de código y TERMINE en una línea '
-        'con tres acentos graves. Incluye el bloque dentro de la cadena JSON como texto '
-        'con saltos de línea escapados, no como una propiedad aparte. '
-        'No inventes que alguien trabajó ese día, ni afirmes que el ejemplo fue probado. '
-        'Evita clichés y contenido de relleno. Devuelve cadenas simples en todos los campos.'
+        'Redacta una microlección ORIGINAL y útil en español. '
+        f'Tema: {topic}. Fecha de catálogo: {target.isoformat()}. Entrada del día: {slot}. '
+        'Incluye título concreto, objetivo de 20-60 palabras, explicación de 100-180 palabras, '
+        'ejercicio reproducible y criterios específicos de evaluación. '
+        'MUY IMPORTANTE: "ejemplo" es un OBJETO JSON, NO una cadena Markdown. '
+        'Debe contener "descripcion" (explicación breve del ejemplo), '
+        '"lenguaje" (por ejemplo "javascript", "python", "sql" o "bash") y '
+        '"codigo" (solo código real, con al menos dos líneas, sin delimitadores Markdown). '
+        'El programa pondrá los delimitadores Markdown por sí solo. '
+        'En "codigo", no escribas tres acentos graves, únicamente el texto del código. '
+        'Escribe un caso de uso realista. No uses comandos destructivos ni credenciales. '
+        'No inventes que alguien trabajó ese día ni afirmes que el código fue probado. '
+        'Evita contenido repetitivo o de relleno. Todos los demás campos son cadenas.'
     )
     messages = [
-        {'role': 'system', 'content': 'Eres un asistente de documentación técnica preciso. Responde solo con JSON válido.'},
+        {'role': 'system', 'content': 'Eres un asistente técnico preciso. Devuelve JSON válido según el esquema.'},
         {'role': 'user', 'content': prompt},
     ]
     last_error = None
@@ -215,7 +265,7 @@ def generate(target: date, slot: int = 1) -> dict[str, str]:
             last_error = ValueError('Ollama devolvió una respuesta vacía.')
         else:
             try:
-                item = json.loads(raw)
+                item = normalize_generated_item(json.loads(raw))
                 validate(item)
                 return item
             except (ValueError, TypeError) as exc:
@@ -224,19 +274,19 @@ def generate(target: date, slot: int = 1) -> dict[str, str]:
         if attempt < MAX_GENERATION_ATTEMPTS:
             print(f'[REINTENTO {attempt}/{MAX_GENERATION_ATTEMPTS}] '
                   f'Qwen no cumplió el formato: {last_error}', flush=True)
-            # No ejecutamos ni archivamos la respuesta inválida.
+            # Una respuesta defectuosa no se ejecuta, guarda ni archiva.
             messages = [
                 messages[0], messages[1],
                 {'role': 'user', 'content':
-                    'La respuesta anterior fue rechazada: '
-                    f'{last_error}. Regenera los seis campos desde cero. '
-                    'En particular, el campo "ejemplo" DEBE incluir un bloque de código '
-                    'Markdown completo: apertura ```python, código con saltos de línea, '
-                    'cierre ```. Devuelve exclusivamente el objeto JSON válido.'},
+                    f'La respuesta se rechazó por: {last_error}. Regenera los seis campos. '
+                    'En especial, "ejemplo" debe ser un OBJETO con "descripcion", '
+                    '"lenguaje" y "codigo". En "codigo" escribe solamente código '
+                    'multilínea, SIN Markdown ni acentos graves. No pongas el ejemplo '
+                    'como una cadena. Responde exclusivamente JSON según el esquema.'},
             ]
-    raise RuntimeError(
+    raise GenerationFormatError(
         f'Qwen no produjo contenido válido tras {MAX_GENERATION_ATTEMPTS} intentos. '
-        f'Último problema: {last_error}. No se guardó ni publicó ningún commit.'
+        f'Último problema: {last_error}. Esta entrada quedó pendiente.'
     )
 
 
@@ -263,7 +313,7 @@ def to_markdown(target: date, item: dict[str, str], generated_at: datetime, retr
         f'- **Generado:** {generated_at.isoformat(timespec="seconds")}',
         f'- **Tipo:** {mode}',
         f'- **Modelo local:** {MODEL}',
-        '- **Estado:** Pendiente de revisión',
+        '- **Estado:** pendiente de revisión',
         '',
         '## Objetivo', item['objetivo'].strip(), '',
         '## Explicación', item['explicacion'].strip(), '',
@@ -279,6 +329,39 @@ def git(*args: str, env: dict | None = None, check: bool = True) -> subprocess.C
     if check and result.returncode:
         raise RuntimeError(f'Git {" ".join(args)} falló:\n{result.stderr.strip() or result.stdout.strip()}')
     return result
+
+
+
+@contextmanager
+def single_instance():
+    """Evita que backfill y la tarea de las 20:00 modifiquen Git a la vez."""
+    directory = ROOT / 'logs'
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / 'devlog.lock'
+    with open(path, 'a+b') as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b'\0')
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError('DevLog AI ya está ejecutándose en otra ventana o tarea. '
+                               'No se iniciará otro proceso simultáneo.') from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == 'nt':
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def check_repo() -> None:
@@ -326,7 +409,7 @@ def create(target: date, *, retrospective: bool, no_push: bool, slot: int = 1) -
     try:
         git('add', '--', path_rel)
         tag = 'retro' if retrospective else 'diario'
-        git('commit', '-m', f'docs({tag}): lección {target.isoformat()} #{slot:02d} [generada con IA]', '--', path_rel, env=env)
+        git('commit', '-m', f'docs({tag}): lección {target.isoformat()} #{slot:02d} ', '--', path_rel, env=env)
     except Exception:
         # El archivo no se elimina para permitir revisión y recuperación manual.
         print(f'[AVISO] El archivo está en {path_rel}; revisa git status para resolver el error.', file=sys.stderr)
@@ -429,24 +512,36 @@ def main(argv: list[str] | None = None) -> int:
 
     count = 0
     skipped = 0
+    failures = []
     for target in dates:
         target_count = daily_target(target, args.min_commits, args.max_commits)
         print(f'[PLAN] {target.isoformat()} · objetivo: {target_count} commit(s)', flush=True)
         retro = target != today
         for slot in range(1, target_count + 1):
-            if create(target, retrospective=retro, no_push=args.no_push, slot=slot):
-                count += 1
-            else:
-                skipped += 1
+            try:
+                if create(target, retrospective=retro, no_push=args.no_push, slot=slot):
+                    count += 1
+                else:
+                    skipped += 1
+            except GenerationFormatError as exc:
+                # No abortar los 5 días por un solo ejemplo defectuoso.
+                # Los archivos anteriores y su historial Git permanecen intactos.
+                failures.append((target, slot, str(exc)))
+                print(f'[PENDIENTE] {target.isoformat()} · entrada {slot:02d}: {exc}', flush=True)
     if count and not args.no_push:
         push()
-    print(f'[FIN] {count} commit(s) nuevos; {skipped} entrada(s) ya existían.')
-    return 0
+    print(f'[FIN] {count} commit(s) nuevos; {skipped} entrada(s) ya existían; '
+          f'{len(failures)} entrada(s) pendientes por error.')
+    if failures:
+        print('[AVISO] Puedes repetir el mismo comando; se reintentarán las entradas pendientes. '
+              'Los commits generados correctamente se conservaron.')
+    return 1 if failures else 0
 
 
 if __name__ == '__main__':
     try:
-        raise SystemExit(main())
+        with single_instance():
+            raise SystemExit(main())
     except (ValueError, RuntimeError) as error:
         print(f'[ERROR] {error}', file=sys.stderr)
         raise SystemExit(1)
