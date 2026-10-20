@@ -28,8 +28,8 @@ TIMEOUT = int(os.getenv('DEVLOG_TIMEOUT', '360'))
 # Se descarga de RAM tras cinco minutos de inactividad; Ollama lo carga bajo demanda.
 KEEP_ALIVE = os.getenv('DEVLOG_KEEP_ALIVE', '5m')
 MAX_GENERATION_ATTEMPTS = 3
-DEFAULT_MIN_COMMITS = 2
-DEFAULT_MAX_COMMITS = 5
+DEFAULT_MIN_COMMITS = 1
+DEFAULT_MAX_COMMITS = 10
 
 TOPICS = [
     'Git: diferencia entre merge y rebase',
@@ -140,17 +140,25 @@ def selected_topic(target: date, slot: int = 1) -> str:
 
 
 def daily_target(target: date, minimum: int, maximum: int) -> int:
-    """Distribución uniforme reproducible por fecha y configuración.
+    """Meta estable y variada para cada fecha.
 
-    No usamos hash() de Python porque cambia entre ejecuciones. Repetir un día
-    conserva su objetivo y permite reanudar sin commits duplicados.
+    Cada bloque de 10 días reparte equilibradamente el rango elegido. Para
+    1..10, cada valor aparece exactamente una vez por bloque, pero en orden
+    barajado con una semilla reproducible. Reanudar nunca cambia la meta.
     """
     if not 1 <= minimum <= maximum <= 10:
         raise ValueError('El rango debe estar entre 1 y 10, y mínimo <= máximo.')
+    delta = (target - START_DATE).days
+    block, slot = divmod(delta, 10)
     seed = int.from_bytes(hashlib.sha256(
-        f'devlog-v1.2:{target.isoformat()}:{minimum}:{maximum}'.encode('utf-8')
+        f'devlog-v1.3:{block}:{minimum}:{maximum}'.encode('utf-8')
     ).digest()[:8], 'big')
-    return random.Random(seed).randint(minimum, maximum)
+    options = list(range(minimum, maximum + 1))
+    # En rangos inferiores a 10, repetir opciones permite distribuirlas
+    # sin que todos los días reciban siempre el mismo valor.
+    distribution = [options[i % len(options)] for i in range(10)]
+    random.Random(seed).shuffle(distribution)
+    return distribution[slot]
 
 
 def generate(target: date, slot: int = 1) -> dict[str, str]:
@@ -255,7 +263,7 @@ def to_markdown(target: date, item: dict[str, str], generated_at: datetime, retr
         f'- **Generado:** {generated_at.isoformat(timespec="seconds")}',
         f'- **Tipo:** {mode}',
         f'- **Modelo local:** {MODEL}',
-        '- **Estado:** pendiente de revisión',
+        '- **Estado:** Pendiente de revisión',
         '',
         '## Objetivo', item['objetivo'].strip(), '',
         '## Explicación', item['explicacion'].strip(), '',
@@ -363,9 +371,14 @@ def main(argv: list[str] | None = None) -> int:
     add_count_options(backfill)
     backfill.add_argument('--start', type=parse_date, default=START_DATE)
     backfill.add_argument('--end', type=parse_date, default=date(2026, 10, 19))
-    backfill.add_argument('--limit', type=int, default=5, help='Máximo de entradas por ejecución (por defecto, 5)')
+    backfill.add_argument('--limit', type=int, default=5, help='Máximo de días incompletos por ejecución (por defecto, 5)')
     backfill.add_argument('--confirm-retrospective', action='store_true', help='Reconozco que es contenido generado ahora, no actividad humana histórica')
     backfill.add_argument('--no-push', action='store_true')
+
+    plan = sub.add_parser('plan', help='Previsualiza cantidad de commits por fecha sin llamar a Qwen ni cambiar Git')
+    add_count_options(plan)
+    plan.add_argument('--start', type=parse_date, default=START_DATE)
+    plan.add_argument('--end', type=parse_date, default=date(2026, 10, 19))
 
     catchup = sub.add_parser('catchup', help='Incluye hoy y recupera ejecuciones automatizadas perdidas')
     add_count_options(catchup)
@@ -380,6 +393,22 @@ def main(argv: list[str] | None = None) -> int:
     dates: list[date]
     if args.command == 'daily':
         dates = [today]
+    elif args.command == 'plan':
+        if args.end < args.start or args.end > today:
+            parser.error('El intervalo debe ser válido y no incluir fechas futuras.')
+        targets = 0
+        missing = 0
+        for target in days_in_range(args.start, args.end):
+            goal = daily_target(target, args.min_commits, args.max_commits)
+            existing = sum(file_for(target, slot).exists() for slot in range(1, goal + 1))
+            extras = sum(file_for(target, slot).exists() for slot in range(goal + 1, 11))
+            targets += goal
+            missing += goal - existing
+            extra_note = f' · fuera del objetivo: {extras}' if extras else ''
+            print(f'[PLAN] {target.isoformat()} · objetivo: {goal} · existentes: {existing} '
+                  f'· faltan: {goal - existing}{extra_note}')
+        print(f'[RESUMEN] {targets} entradas objetivo · {missing} entradas por generar.')
+        return 0
     elif args.command == 'backfill':
         if not args.confirm_retrospective:
             parser.error('Para backfill usa --confirm-retrospective (ver README.md).')
