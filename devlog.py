@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import time as wall_time
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -33,6 +34,10 @@ MAX_GENERATION_ATTEMPTS = 3
 
 class GenerationFormatError(RuntimeError):
     """La respuesta de Ollama es inválida, pero el lote puede continuar."""
+
+
+class GamingPause(RuntimeError):
+    """Usuario activo o juego detectado entre dos generaciones."""
 
 DEFAULT_MIN_COMMITS = 1
 DEFAULT_MAX_COMMITS = 10
@@ -310,10 +315,10 @@ def to_markdown(target: date, item: dict[str, str], generated_at: datetime, retr
         '',
         f'- **Fecha del catálogo:** {target.isoformat()}',
         f'- **Entrada n.º:** {slot}',
-        f'- **Generado:** {generated_at.isoformat(timespec="seconds")}',
+        f'- **Generado realmente:** {generated_at.isoformat(timespec="seconds")}',
         f'- **Tipo:** {mode}',
         f'- **Modelo local:** {MODEL}',
-        '- **Estado:** pendiente de revisión',
+        '- **Estado:** generado por IA; contenido pendiente de revisión humana',
         '',
         '## Objetivo', item['objetivo'].strip(), '',
         '## Explicación', item['explicacion'].strip(), '',
@@ -325,7 +330,7 @@ def to_markdown(target: date, item: dict[str, str], generated_at: datetime, retr
 
 
 def git(*args: str, env: dict | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(['git', *args], cwd=ROOT, env=env, capture_output=True, text=True, encoding='utf-8', errors='replace')
+    result = subprocess.run(['git', *args], cwd=ROOT, env=env, capture_output=True, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), encoding='utf-8', errors='replace')
     if check and result.returncode:
         raise RuntimeError(f'Git {" ".join(args)} falló:\n{result.stderr.strip() or result.stdout.strip()}')
     return result
@@ -409,7 +414,7 @@ def create(target: date, *, retrospective: bool, no_push: bool, slot: int = 1) -
     try:
         git('add', '--', path_rel)
         tag = 'retro' if retrospective else 'diario'
-        git('commit', '-m', f'docs({tag}): lección {target.isoformat()} #{slot:02d} ', '--', path_rel, env=env)
+        git('commit', '-m', f'docs({tag}): lección {target.isoformat()} #{slot:02d} [generada con IA]', '--', path_rel, env=env)
     except Exception:
         # El archivo no se elimina para permitir revisión y recuperación manual.
         print(f'[AVISO] El archivo está en {path_rel}; revisa git status para resolver el error.', file=sys.stderr)
@@ -437,7 +442,96 @@ def parse_date(raw: str) -> date:
         raise argparse.ArgumentTypeError('Usa la fecha YYYY-MM-DD.') from exc
 
 
-def main(argv: list[str] | None = None) -> int:
+def release_qwen() -> None:
+    """Descarga del modelo mediante API local oficial. No afecta al servicio Ollama."""
+    payload = {'model': MODEL, 'messages': [], 'keep_alive': 0, 'stream': False}
+    req = Request(OLLAMA_URL, data=json.dumps(payload).encode('utf-8'),
+                  headers={'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urlopen(req, timeout=25) as response:
+            result = json.load(response)
+        print(f'[VRAM] Qwen descargado de Ollama ({result.get("done_reason", "solicitado")}).', flush=True)
+    except (OSError, ValueError, HTTPError, URLError, TimeoutError) as exc:
+        print(f'[AVISO] No fue posible descargar Qwen: {exc}. '
+              'Ollama aplicará su keep_alive normal.', flush=True)
+
+
+def gaming_status() -> int:
+    from gaming_safe import check, load_config
+    config = load_config(ROOT)
+    status = check(config, before_load=True)
+    print('[GAMING SAFE] ' + status.display(), flush=True)
+    print('[GAMING SAFE] Esta prueba no genera commits ni carga Qwen.', flush=True)
+    return 0 if status.safe else 2
+
+
+def gaming_safe_run(*, days: int, interval_minutes: int, max_wait_minutes: int,
+                    once: bool = False, no_push: bool = False) -> int:
+    """Se ejecuta a las 20:00; si no hay recursos, espera sin cargar Qwen.
+
+    Permanece en espera dentro de la misma tarea de Windows. Si alguien usa el
+    teclado/ratón entre entradas, se conserva el progreso y se vuelve a esperar.
+    """
+    from gaming_safe import check, load_config
+    cfg = load_config(ROOT)
+    if not 1 <= days <= 366:
+        raise ValueError('--days debe estar entre 1 y 366.')
+    if not 1 <= interval_minutes <= 120:
+        raise ValueError('--interval-minutes debe estar entre 1 y 120.')
+    if not 1 <= max_wait_minutes <= 1440:
+        raise ValueError('--max-wait-minutes debe estar entre 1 y 1440.')
+    deadline = wall_time.monotonic() + max_wait_minutes * 60
+    print(f'[GAMING SAFE] Vigilancia iniciada: intervalo {interval_minutes} min; '
+          f'ventana de espera {max_wait_minutes} min; inactividad {cfg["idle_minutes"]} min; '
+          f'GPU < {cfg["max_gpu_utilization_percent"]}%; '
+          f'VRAM libre >= {cfg["min_free_vram_mib"]} MiB.', flush=True)
+    while True:
+        before = check(cfg, before_load=True)
+        print('[GAMING SAFE] ' + before.display(), flush=True)
+        ready = before.safe
+        if ready and cfg['stable_seconds']:
+            print(f'[GAMING SAFE] Confirmando estabilidad durante {cfg["stable_seconds"]} s...', flush=True)
+            if wall_time.monotonic() + cfg['stable_seconds'] > deadline:
+                ready = False
+            else:
+                wall_time.sleep(cfg['stable_seconds'])
+                after = check(cfg, before_load=True)
+                print('[GAMING SAFE] Segunda medición: ' + after.display(), flush=True)
+                ready = after.safe
+        if ready:
+            attempted = False
+            def pause_if_playing():
+                nonlocal attempted
+                # No consultar GPU durante Qwen: la carga de inferencia daría un falso positivo.
+                stage = check(cfg, before_load=False)
+                if not stage.safe:
+                    raise GamingPause(stage.display())
+                attempted = True
+            try:
+                print('[GAMING SAFE] Condiciones libres. Iniciando catchup...', flush=True)
+                rc = main(['catchup', '--days', str(days)] + (['--no-push'] if no_push else []),
+                          safety_guard=pause_if_playing)
+            finally:
+                if attempted and cfg['unload_qwen_after_run']:
+                    release_qwen()
+            if rc != 3:
+                return rc
+            print('[GAMING SAFE] Se pausó entre entradas: progreso conservado. '
+                  'Se reintentará cuando el equipo esté libre.', flush=True)
+        if once:
+            print('[GAMING SAFE] Ejecución única pospuesta; no se inició trabajo inseguro.', flush=True)
+            return 2
+        remaining = deadline - wall_time.monotonic()
+        if remaining <= 0:
+            print('[GAMING SAFE] Terminó la ventana de espera sin condiciones adecuadas. '
+                  'La próxima tarea recuperará hasta los días configurados.', flush=True)
+            return 0
+        delay = min(interval_minutes * 60, remaining)
+        print(f'[GAMING SAFE] Próxima evaluación en {delay/60:.1f} min.', flush=True)
+        wall_time.sleep(delay)
+
+
+def main(argv: list[str] | None = None, *, safety_guard=None) -> int:
     parser = argparse.ArgumentParser(description='DevLog AI — diario de desarrollo con Qwen local')
     sub = parser.add_subparsers(dest='command', required=True)
     def add_count_options(command):
@@ -468,7 +562,22 @@ def main(argv: list[str] | None = None) -> int:
     catchup.add_argument('--days', type=int, default=7)
     catchup.add_argument('--no-push', action='store_true')
 
+    status_cmd = sub.add_parser('safe-status', help='Muestra si Gaming Safe puede iniciar sin cargar Qwen ni tocar Git')
+    safe_run = sub.add_parser('safe-run', help='Espera hasta que el equipo esté libre y ejecuta catchup')
+    safe_run.add_argument('--days', type=int, default=7, help='Ventana de recuperación automática, por defecto 7 días')
+    safe_run.add_argument('--interval-minutes', type=int, default=15, help='Cada cuántos minutos revisar si está ocupado')
+    safe_run.add_argument('--max-wait-minutes', type=int, default=420, help='Tiempo máximo de espera, por defecto 7 horas')
+    safe_run.add_argument('--once', action='store_true', help='Comprueba y prueba solo una vez; útil para diagnóstico')
+    safe_run.add_argument('--no-push', action='store_true', help='No enviar a GitHub')
+
     args = parser.parse_args(argv)
+    if args.command == 'safe-status':
+        return gaming_status()
+    if args.command == 'safe-run':
+        check_repo()
+        return gaming_safe_run(days=args.days, interval_minutes=args.interval_minutes,
+                               max_wait_minutes=args.max_wait_minutes, once=args.once,
+                               no_push=args.no_push)
     if not 1 <= args.min_commits <= args.max_commits <= 10:
         parser.error('Indica --min-commits y --max-commits entre 1 y 10 (min <= max).')
     check_repo()
@@ -519,10 +628,19 @@ def main(argv: list[str] | None = None) -> int:
         retro = target != today
         for slot in range(1, target_count + 1):
             try:
+                if safety_guard is not None and not file_for(target, slot).exists():
+                    safety_guard()
                 if create(target, retrospective=retro, no_push=args.no_push, slot=slot):
                     count += 1
                 else:
                     skipped += 1
+            except GamingPause as exc:
+                print(f'[PAUSA] {exc}', flush=True)
+                if count and not args.no_push:
+                    push()
+                print(f'[PAUSA] {count} commit(s) nuevos conservados; '
+                      'las entradas pendientes se reanudarán en la siguiente oportunidad.', flush=True)
+                return 3
             except GenerationFormatError as exc:
                 # No abortar los 5 días por un solo ejemplo defectuoso.
                 # Los archivos anteriores y su historial Git permanecen intactos.

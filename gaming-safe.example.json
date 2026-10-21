@@ -1,0 +1,15 @@
+{
+  "idle_minutes": 10,
+  "max_gpu_utilization_percent": 30,
+  "min_free_vram_mib": 9000,
+  "stable_seconds": 120,
+  "gpu_index": 0,
+  "games": [
+    "cs2.exe",
+    "valorant-win64-shipping.exe",
+    "fortniteclient-win64-shipping.exe",
+    "r5apex.exe",
+    "cyberpunk2077.exe"
+  ],
+  "unload_qwen_after_run": true
+}
