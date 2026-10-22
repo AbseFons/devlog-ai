@@ -1,6 +1,6 @@
 {
-  "idle_minutes": 10,
-  "max_gpu_utilization_percent": 30,
+  "idle_minutes": 0,
+  "max_gpu_utilization_percent": 10,
   "min_free_vram_mib": 9000,
   "stable_seconds": 120,
   "gpu_index": 0,
