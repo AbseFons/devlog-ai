@@ -1,8 +1,9 @@
-"""Gaming Safe de DevLog AI: solo inicia inferencia en sesiones Windows inactivas.
+"""Gaming Safe de DevLog AI: inicia Qwen solo con GPU disponible.
 
-No es un detector infalible de videojuegos. Protección conservadora:
-Windows idle + procesos conocidos + GPU NVIDIA + VRAM disponible.
-No ejecuta ni finaliza juegos; nunca termina una inferencia de Ollama en curso.
+No es un detector infalible de videojuegos. Combina procesos conocidos,
+utilización de GPU NVIDIA y memoria libre. La comprobación de inactividad
+es opcional y está desactivada por defecto.
+No finaliza juegos ni interrumpe una inferencia de Ollama en curso.
 """
 from __future__ import annotations
 
@@ -28,8 +29,8 @@ DEFAULT_GAMES = [
 ]
 
 DEFAULT_CONFIG = {
-    'idle_minutes': 10,
-    'max_gpu_utilization_percent': 30,
+    'idle_minutes': 0,  # 0: no exigir inactividad de teclado/ratón
+    'max_gpu_utilization_percent': 10,
     'min_free_vram_mib': 9000,
     'stable_seconds': 120,
     'gpu_index': 0,
@@ -54,7 +55,7 @@ class Status:
     def display(self) -> str:
         gpu = '?' if self.gpu_percent is None else f'{self.gpu_percent:.0f}%'
         mem = '?' if self.free_vram_mib is None else f'{self.free_vram_mib} MiB'
-        idle = '?' if self.idle_seconds is None else f'{self.idle_seconds/60:.1f} min'
+        idle = 'no exigida' if self.idle_seconds is None else f'{self.idle_seconds/60:.1f} min'
         label = 'LIBRE' if self.safe else 'POSPONER'
         details = '; '.join(self.reasons) if self.reasons else 'condiciones cumplidas'
         return f'[{label}] inactividad: {idle} · GPU: {gpu} · VRAM libre: {mem} · {details}'
@@ -74,7 +75,7 @@ def load_config(root: Path) -> dict:
             raise ValueError(f'Claves desconocidas en gaming-safe.local.json: {sorted(extra)}')
         config.update(raw)
     for key, low, high in (
-        ('idle_minutes', 1, 120), ('max_gpu_utilization_percent', 1, 90),
+        ('idle_minutes', 0, 120), ('max_gpu_utilization_percent', 1, 90),
         ('min_free_vram_mib', 256, 65536), ('stable_seconds', 0, 3600),
         ('gpu_index', 0, 15),
     ):
@@ -161,12 +162,13 @@ def check(config: dict, *, before_load: bool = True) -> Status:
     idle = utilization = None
     free = None
     games = ()
-    try:
-        idle = windows_idle_seconds()
-        if idle < config['idle_minutes'] * 60:
-            reasons.append(f'equipo activo (< {config["idle_minutes"]} min)')
-    except (OSError, SafetyUnavailable) as exc:
-        reasons.append(f'inactividad no verificable: {exc}')
+    if config['idle_minutes'] > 0:
+        try:
+            idle = windows_idle_seconds()
+            if idle < config['idle_minutes'] * 60:
+                reasons.append(f'equipo activo (< {config["idle_minutes"]} min)')
+        except (OSError, SafetyUnavailable) as exc:
+            reasons.append(f'inactividad no verificable: {exc}')
     try:
         games = active_game_processes(config['games'])
         if games:

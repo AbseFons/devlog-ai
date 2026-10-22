@@ -467,10 +467,10 @@ def gaming_status() -> int:
 
 def gaming_safe_run(*, days: int, interval_minutes: int, max_wait_minutes: int,
                     once: bool = False, no_push: bool = False) -> int:
-    """Se ejecuta a las 20:00; si no hay recursos, espera sin cargar Qwen.
+    """Se ejecuta a las 20:00; si la GPU está ocupada, espera sin cargar Qwen.
 
-    Permanece en espera dentro de la misma tarea de Windows. Si alguien usa el
-    teclado/ratón entre entradas, se conserva el progreso y se vuelve a esperar.
+    Permanece dentro de la tarea de Windows. Comprueba juegos conocidos antes
+    de cada entrada; la inactividad humana solo se aplica si se configura.
     """
     from gaming_safe import check, load_config
     cfg = load_config(ROOT)
@@ -481,8 +481,10 @@ def gaming_safe_run(*, days: int, interval_minutes: int, max_wait_minutes: int,
     if not 1 <= max_wait_minutes <= 1440:
         raise ValueError('--max-wait-minutes debe estar entre 1 y 1440.')
     deadline = wall_time.monotonic() + max_wait_minutes * 60
+    idle_policy = 'no exigida' if cfg['idle_minutes'] == 0 else f'{cfg["idle_minutes"]} min'
     print(f'[GAMING SAFE] Vigilancia iniciada: intervalo {interval_minutes} min; '
-          f'ventana de espera {max_wait_minutes} min; inactividad {cfg["idle_minutes"]} min; '
+          f'ventana de espera {max_wait_minutes} min; '
+          f'inactividad {idle_policy}; '
           f'GPU < {cfg["max_gpu_utilization_percent"]}%; '
           f'VRAM libre >= {cfg["min_free_vram_mib"]} MiB.', flush=True)
     while True:
