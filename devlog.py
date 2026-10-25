@@ -315,10 +315,10 @@ def to_markdown(target: date, item: dict[str, str], generated_at: datetime, retr
         '',
         f'- **Fecha del catálogo:** {target.isoformat()}',
         f'- **Entrada n.º:** {slot}',
-        f'- **Generado realmente:** {generated_at.isoformat(timespec="seconds")}',
+        f'- **Generado:** {generated_at.isoformat(timespec="seconds")}',
         f'- **Tipo:** {mode}',
         f'- **Modelo local:** {MODEL}',
-        '- **Estado:** generado por IA; contenido pendiente de revisión humana',
+        '- **Estado:** pendiente de revisión',
         '',
         '## Objetivo', item['objetivo'].strip(), '',
         '## Explicación', item['explicacion'].strip(), '',
@@ -414,7 +414,7 @@ def create(target: date, *, retrospective: bool, no_push: bool, slot: int = 1) -
     try:
         git('add', '--', path_rel)
         tag = 'retro' if retrospective else 'diario'
-        git('commit', '-m', f'docs({tag}): lección {target.isoformat()} #{slot:02d} [generada con IA]', '--', path_rel, env=env)
+        git('commit', '-m', f'docs({tag}): lección {target.isoformat()} #{slot:02d}', '--', path_rel, env=env)
     except Exception:
         # El archivo no se elimina para permitir revisión y recuperación manual.
         print(f'[AVISO] El archivo está en {path_rel}; revisa git status para resolver el error.', file=sys.stderr)
